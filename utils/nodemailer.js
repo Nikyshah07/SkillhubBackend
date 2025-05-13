@@ -16,7 +16,7 @@ const sendEmailNotification = (toEmail, subject, text) => {
     from: process.env.EMAIL,
     to: toEmail,
     subject: subject,
-    text: text,
+    html:html
   };
 
   // Send email
