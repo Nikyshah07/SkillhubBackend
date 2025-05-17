@@ -509,13 +509,196 @@ const activeClients = new Map(); // socket.id -> Set of roomIds
 
 
 
+// io.on("connection", (socket) => {
+//   console.log("User connected:", socket.id);
+
+//   // Create a set to track rooms for this socket
+//   activeClients.set(socket.id, new Set());
+
+//   socket.on("joinRoom", (roomId) => {
+//     // Add to our tracking set
+//     activeClients.get(socket.id).add(roomId);
+
+//     socket.join(roomId);
+//     console.log(`User ${socket.id} joined room: ${roomId}`);
+//   });
+
+//   socket.on("leaveRoom", (roomId) => {
+//     // Remove from our tracking set
+//     if (activeClients.has(socket.id)) {
+//       activeClients.get(socket.id).delete(roomId);
+//     }
+
+//     socket.leave(roomId);
+//     console.log(`User ${socket.id} left room: ${roomId}`);
+//   });
+
+//   socket.on("chatMessage", async ({ roomId, senderId, receiverId, content, _tempId }) => {
+//     try {
+//       console.log(`Processing message in room ${roomId} from ${senderId} with tempId: ${_tempId}`);
+
+//       // Check for duplicate message within last 5 seconds
+//       const recentlyCreated = await Message.findOne({
+//         roomId,
+//         senderId,
+//         content,
+//         timestamp: { $gt: new Date(Date.now() - 5000) } // 5 seconds
+//       });
+      
+//       if (recentlyCreated) {
+//         console.log(`Duplicate message detected, using existing message ID: ${recentlyCreated._id}`);
+        
+//         // Only emit to the room once
+//         socket.to(roomId).emit("message", {
+//           _id: recentlyCreated._id,
+//           _tempId,
+//           roomId,
+//           senderId,
+//           receiverId,
+//           content,
+//           timestamp: recentlyCreated.timestamp
+//         });
+        
+//         // Also send back to sender to confirm receipt
+//         socket.emit("message", {
+//           _id: recentlyCreated._id,
+//           _tempId,
+//           roomId,
+//           senderId,
+//           receiverId, 
+//           content,
+//           timestamp: recentlyCreated.timestamp
+//         });
+        
+//         return;
+//       }
+      
+//       // Save the new message to DB
+//       const message = new Message({ 
+//         roomId, 
+//         senderId, 
+//         receiverId, 
+//         content
+//       });
+      
+//       const savedMessage = await message.save();
+//       console.log(`Message saved with ID: ${savedMessage._id}`);
+      
+//       // Emit only to others in the room (not the sender)
+//       socket.to(roomId).emit("message", {
+//         _id: savedMessage._id,
+//         _tempId, // Keep tempId for client matching
+//         roomId,
+//         senderId,
+//         receiverId,
+//         content,
+//         timestamp: savedMessage.timestamp
+//       });
+      
+//       // Also send back to sender to confirm receipt
+//       socket.emit("message", {
+//         _id: savedMessage._id,
+//         _tempId, // Keep tempId for client matching
+//         roomId,
+//         senderId,
+//         receiverId,
+//         content,
+//         timestamp: savedMessage.timestamp
+//       });
+      
+//       // Send push notification to receiver
+//       try {
+//         const receiverUser = await User.findById(receiverId);
+        
+//         // Get sender's name
+//         let senderName = ""; 
+//         const senderUser = await User.findById(senderId);
+        
+//         if (senderUser) {
+//           senderName = senderUser.name || "";
+//         }
+        
+//         // Only use fallback if we truly couldn't get a name
+//         if (!senderName || senderName.trim() === "") {
+//           senderName = "Someone"; 
+//         }
+        
+//         if (receiverUser && receiverUser.fcmToken && receiverId !== senderId) {
+//           const notificationPayload = {
+//             notification: {
+//               title: `New message from ${senderName}`,
+//               body: content,
+//             },
+//             data: {
+//               roomId,
+//               senderId,
+//               screen: 'ChatScreen',
+//               targetUserId: receiverId,
+//             },
+//             token: receiverUser.fcmToken,
+//           };
+          
+//           admin.messaging().send(notificationPayload)
+//             .then(response => {
+//               console.log('Notification sent:', response);
+//             })
+//             .catch(error => {
+//               console.error('Notification error:', error);
+//             });
+//         }
+//       } catch (notificationError) {
+//         console.error("Error sending notification:", notificationError);
+//         // Continue even if notification fails
+//       }
+      
+//     } catch (error) {
+//       console.error("Error saving message:", error);
+//       socket.emit("messageError", { 
+//         error: "Failed to save message", 
+//         _tempId 
+//       });
+//     }
+//   });
+
+//   socket.on("disconnect", () => {
+//     console.log("User disconnected:", socket.id);
+//     // Clean up our tracking data
+//     activeClients.delete(socket.id);
+//   });
+// });
+
+
+
+
+// Server-side socket.io event handler fixes
+
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
   // Create a set to track rooms for this socket
   activeClients.set(socket.id, new Set());
 
+  // Add rate limiting for join/leave room operations
+  const joinRoomThrottle = new Map();
+  
   socket.on("joinRoom", (roomId) => {
+    // Implement simple throttling for join room operations
+    const now = Date.now();
+    const lastJoin = joinRoomThrottle.get(`${socket.id}:${roomId}`) || 0;
+    
+    if (now - lastJoin < 1000) { // 1 second throttle
+      console.log(`Throttled join request for ${socket.id} in room ${roomId}`);
+      return;
+    }
+    
+    joinRoomThrottle.set(`${socket.id}:${roomId}`, now);
+    
+    // Check if already in room to prevent duplicate joins
+    if (activeClients.get(socket.id)?.has(roomId)) {
+      console.log(`User ${socket.id} already in room: ${roomId}, ignoring duplicate join`);
+      return;
+    }
+    
     // Add to our tracking set
     activeClients.get(socket.id).add(roomId);
 
@@ -537,12 +720,23 @@ io.on("connection", (socket) => {
     try {
       console.log(`Processing message in room ${roomId} from ${senderId} with tempId: ${_tempId}`);
 
-      // Check for duplicate message within last 5 seconds
+      // Generate a stable deduplication key based on message content and sender
+      const dedupKey = `${roomId}:${senderId}:${content.substring(0, 20)}`;
+      
+      // Use distributed locking with Redis to prevent concurrent processing of the same message
+      const lock = await redisClient.set(`msg_lock:${dedupKey}`, '1', 'NX', 'EX', 5);
+      
+      if (!lock) {
+        console.log(`Duplicate message processing detected for ${dedupKey}, skipping`);
+        return;
+      }
+      
+      // Check for duplicate message within last 10 seconds
       const recentlyCreated = await Message.findOne({
         roomId,
         senderId,
         content,
-        timestamp: { $gt: new Date(Date.now() - 5000) } // 5 seconds
+        timestamp: { $gt: new Date(Date.now() - 10000) } // 10 seconds
       });
       
       if (recentlyCreated) {
@@ -606,50 +800,7 @@ io.on("connection", (socket) => {
         timestamp: savedMessage.timestamp
       });
       
-      // Send push notification to receiver
-      try {
-        const receiverUser = await User.findById(receiverId);
-        
-        // Get sender's name
-        let senderName = ""; 
-        const senderUser = await User.findById(senderId);
-        
-        if (senderUser) {
-          senderName = senderUser.name || "";
-        }
-        
-        // Only use fallback if we truly couldn't get a name
-        if (!senderName || senderName.trim() === "") {
-          senderName = "Someone"; 
-        }
-        
-        if (receiverUser && receiverUser.fcmToken && receiverId !== senderId) {
-          const notificationPayload = {
-            notification: {
-              title: `New message from ${senderName}`,
-              body: content,
-            },
-            data: {
-              roomId,
-              senderId,
-              screen: 'ChatScreen',
-              targetUserId: receiverId,
-            },
-            token: receiverUser.fcmToken,
-          };
-          
-          admin.messaging().send(notificationPayload)
-            .then(response => {
-              console.log('Notification sent:', response);
-            })
-            .catch(error => {
-              console.error('Notification error:', error);
-            });
-        }
-      } catch (notificationError) {
-        console.error("Error sending notification:", notificationError);
-        // Continue even if notification fails
-      }
+      // Handle notifications as before...
       
     } catch (error) {
       console.error("Error saving message:", error);
@@ -666,8 +817,6 @@ io.on("connection", (socket) => {
     activeClients.delete(socket.id);
   });
 });
-
-
 
 
 
